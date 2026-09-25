@@ -1,0 +1,20 @@
+{
+  "state": "訂單 #1234 已於 9/20 出貨，物流單號 ABC123。",
+  "questions": {
+    "shipped": {
+      "type": "noul",
+      "instructions": "這筆訂單出貨了嗎？",
+      "criteria": {"true": "已出貨", "false": "尚未出貨"}
+    },
+    "category": {
+      "type": "choice",
+      "instructions": "這段文字屬於哪一類？",
+      "criteria": {"shipping": "出貨通知", "refund": "退款", "other": "其他"}
+    },
+    "risk": {
+      "type": "score",
+      "instructions": "客訴風險",
+      "criteria": ["低", "中", "高"]
+    }
+  }
+}
