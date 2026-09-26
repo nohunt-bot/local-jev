@@ -17,6 +17,7 @@ TypeSafe 的關係），把 Jev 包成 11 個 MCP（Model Context Protocol）工
    （System One 相容端點：接受同樣 `{state, questions}` 請求、回傳同樣答案格式的 HTTP 服務）。
 
 兩種用法共用同一套讀取程式。`parity_test.py` 把同一批輸入送進兩條路，要求送給引擎的請求和回傳的結果完全一樣。
+為什麼這樣做、還有哪些引擎和模型可以選，見研究報告 [docs/research.md](docs/research.md)。
 
 > **狀態：研究用參考實作，不是正式服務。**
 > 整合路徑已用模擬引擎驗證：11 個工具都回傳有效判定；模型沒照格式回答時（選項字母合計低於 0.5），11 個工具都安全失敗。
@@ -69,6 +70,7 @@ claude mcp list            # jev-local 要顯示 Connected
 | `example-request.json` | 相容端點的 API 範例請求 |
 | `requirements-fastmcp.txt` | FastMCP 版的 Python 套件（fastmcp 4.0.10、mini-racer 0.14.1） |
 | `LICENSES/` | jev-mcp 和 burnigtm/jev-mcp 的 MIT 授權全文（移植的程式碼要附上） |
+| `docs/research.md` | 研究報告（2026-09-25）：Jev 的介面、讀出機率的方法、引擎和模型比較、評估計畫和路線圖 |
 
 ## 需求
 
