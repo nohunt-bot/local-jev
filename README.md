@@ -20,7 +20,7 @@ TypeSafe 的關係），把 Jev 包成 11 個 MCP（Model Context Protocol）工
 
 > **狀態：研究用參考實作，不是正式服務。**
 > 整合路徑已用模擬引擎驗證：11 個工具都回傳有效判定；模型沒照格式回答時（選項字母合計低於 0.5），11 個工具都安全失敗。
-> FastMCP 版和 jev-mcp 0.8.0 在一致性測試裡（模擬引擎、兩種模式、43 種輸入加 15 種錯誤輸入）完全一致。
+> FastMCP 版和 jev-mcp 0.8.0 在一致性測試裡（模擬引擎、兩種模式、43 種輸入加 15 種錯誤輸入）完全一致，回傳的文字逐字相同。
 > **還沒接過真的推論引擎**，判斷品質、校準和速度都還沒測。
 
 ## 快速開始（Mac mini 等 Apple Silicon 的 Mac，FastMCP 版）
@@ -67,13 +67,14 @@ claude mcp list            # jev-local 要顯示 Connected
 | `contract_test.py` | 相容端點的測試：用 `npx` 啟動真的 jev-mcp 0.8.0，逐一呼叫 11 個工具 |
 | `parity_test.py` | 一致性測試：同樣的輸入送進 FastMCP 版和 jev-mcp + 端點，結果必須相同 |
 | `example-request.json` | 相容端點的 API 範例請求 |
-| `requirements-fastmcp.txt` | FastMCP 版的 Python 套件（fastmcp 4.0.10、regex） |
-| `LICENSES/jev-mcp.txt` | jev-mcp 的 MIT 授權全文（移植的程式碼要附上） |
+| `requirements-fastmcp.txt` | FastMCP 版的 Python 套件（fastmcp 4.0.10、mini-racer 0.14.1） |
+| `LICENSES/` | jev-mcp 和 burnigtm/jev-mcp 的 MIT 授權全文（移植的程式碼要附上） |
 
 ## 需求
 
 - Linux 或 macOS。Windows 請用 WSL：`contract_test.py` 用到 POSIX 的程序群組，下面的指令也是 bash 寫法。
-- Python 3.10 以上（3.10、3.13 都跑過相容測試）。FastMCP 版要另外裝 `requirements-fastmcp.txt`；
+- Python 3.10 以上（3.10、3.13 都跑過相容測試）。FastMCP 版要另外裝 `requirements-fastmcp.txt`，其中 mini-racer
+  內建 V8，讓 `jev_extract` 用 JavaScript 跑正規表示式（有 macOS、glibc 2.27 以上的 Linux 和 Windows 的預編版本）；
   相容端點只用標準函式庫（「接上推論引擎」裡的 tokenizer 檢查需要 `transformers`）。
 - 接真模型時：一個支援 `logprobs` 和 `top_logprobs` 的 OpenAI 相容推論引擎。
 - 註冊用 Claude Code 的 `claude` 指令（其他 MCP 用戶端也可以）；相容端點的試打用 `curl`。
@@ -190,26 +191,37 @@ claude mcp add -s user jev-local \
 
 | 變數 | 預設 | 說明 |
 |---|---|---|
-| `JEV_MCP_REQUEST_TIMEOUT_MS` | `60000` | 一次工具呼叫的總期限（毫秒）；候選很多的 `jev_rerank` 在慢的引擎上可能要調高 |
+| `JEV_MCP_REQUEST_TIMEOUT_MS` | `60000` | 一次工具呼叫的期限（毫秒）。每次呼叫引擎前檢查，已經送出的那次呼叫不會被中斷（最多再花 `ENGINE_TIMEOUT_S`）；候選很多的 `jev_rerank` 在慢的引擎上可能要調高 |
 | `JEV_MCP_MAX_ATTEMPTS` | `3` | 單次引擎呼叫遇到暫時性錯誤（連不上、HTTP 408／409／429／5xx）時的嘗試次數，1–6 |
 
-設定不合法時（例如 `MIN_LABEL_MASS` 超出範圍），server 會拒絕啟動，`claude mcp list` 會顯示連線失敗。
+設定不合法時（例如 `MIN_LABEL_MASS` 超出範圍），server 會拒絕啟動，`claude mcp list` 只會顯示連線失敗
+（`Failed to connect`）。要看原因，直接執行註冊的指令，拒絕啟動的訊息會印在終端機，例如：
+
+```bash
+MIN_LABEL_MASS=0 .venv/bin/python jev_fastmcp.py
+```
 
 ### 跟 jev-mcp 0.8.0 的差異
 
-工具名稱、參數、送給模型的題目和判定邏輯都相同。刻意不同的地方：
+工具名稱、參數、送給模型的題目、判定邏輯和回傳的文字都相同。刻意不同的地方：
 
-- 結果裡的 `provider` 是 `"local"`，`model` 是 `ENGINE_MODEL`。
+- 結果裡的 `provider` 是 `"local"`（`jev_extract` 完全沒呼叫模型時，跟 jev-mcp 一樣是 `"none"`），`model` 是 `ENGINE_MODEL`。
 - 引擎呼叫失敗時只重試那一次呼叫；一直失敗就回工具錯誤，並寫出原因：`engine unreachable (…)`、
   `engine returned HTTP 404` 或 `engine reply had no usable logprobs (…)`。
-- 工具說明把「TypeSafe Jev」改成本機模型，拿掉 TypeSafe 的基準測試和「已校準」的說法，並寫出這個 server
-  一題最多幾個選項（超過會回 `invalid_response`）。
-- `jev_extract` 的正規表示式照 JavaScript 語意翻譯後，交給 Python 的 `regex` 套件執行（每個欄位 1 秒上限）：
-  `\d`、`\w`、`\b` 只認 ASCII，`\s` 用 JavaScript 的空白集合，`.`、`^`、`$` 用 JavaScript 的換行字元，
-  跟 JavaScript 一致（`parity_test.py` 直接拿 Node 比對）。少數只有一邊接受的語法（例如 Python 的 `(?P<name>…)`、
-  JavaScript 的 `\c` 跳脫）結果會不同；無效樣式的錯誤訊息是 Python 的文字。
-- 字串長度以 Unicode 字元計算，JavaScript 以 UTF-16 單位計算；只有表情符號這類字元會算得不同。
-- 選填參數也接受 `null`（視同沒填）。
+- `JEV_MCP_REQUEST_TIMEOUT_MS` 在每次呼叫引擎前檢查，已經送出的那次呼叫不會被中斷；用戶端取消也不會中斷
+  正在跑的引擎呼叫。
+- `jev_extract` 的正規表示式跟 jev-mcp 一樣在 V8 裡執行（jev-mcp 用 Node 裡的 V8，這裡透過 mini-racer），
+  比對結果和錯誤訊息跟 JavaScript 相同。mini-racer 的 V8 比 Node 22 新，少數較新的語法（例如 `(?i:…)`）
+  這裡能用、Node 22 會報錯；逾時的時間點也可能略有不同。
+- 字串長度的上限和截斷以 Unicode 字元計算，JavaScript 以 UTF-16 單位計算；只有表情符號這類字元會算得不同。
+- 參數檢查：選填參數（包括項目裡選填的 `id`）也接受 `null`（視同沒填）；整數參數不接受 `5.0`，物件不接受
+  `__proto__` 這個鍵，jev-mcp 兩者都接受（只有非 JavaScript 的用戶端會送出這些）。
+- `jev_classify` 的 `by_class`：類別 id 剛好叫 `constructor`、`toString` 這類名稱時照常計數；jev-mcp 0.8.0 會算錯。
+- 工具說明把「TypeSafe Jev」改成本機模型，拿掉 TypeSafe 的基準測試和「已校準」的說法，寫出這個 server
+  一題最多幾個選項（超過會回 `invalid_response`），`jev_rerank` 另外註明每個候選是一次引擎呼叫。server 會送出
+  MCP instructions，並把所有工具標成唯讀（`readOnlyHint`）、不連外（`openWorldHint` 為 false）。
+- 參數裡有落單的 UTF-16 代理字元（lone surrogate）時，這個 server 不會回應（MCP Python SDK 會丟掉這種請求）；
+  jev-mcp 會回應。
 
 ### 一致性測試
 
@@ -219,10 +231,12 @@ claude mcp add -s user jev-local \
 
 需要 Node.js 22 以上（會用 `npx` 跑 jev-mcp 0.8.0 當對照）。它會：
 
-- 用 Node 驗證移植的 JavaScript 行為（`toFixed`、數字轉字串、`trim`、正規表示式）；
+- 用 Node 驗證移植的 JavaScript 行為：`toFixed`、數字轉字串、`Number()`、`JSON.stringify`、`trim`，以及
+  119 個正規表示式樣式的比對結果和錯誤訊息；
 - 比對兩邊的工具清單和參數；
-- 把 58 種輸入（43 種正常、15 種錯誤）在兩種引擎模式下送進兩條路，比對送給引擎的請求、回傳的結果和錯誤；
-- 確認引擎掛掉時，FastMCP 版回的是寫出原因的工具錯誤。
+- 把 58 種輸入（43 種正常、15 種錯誤）在兩種引擎模式下送進兩條路，比對送給引擎的請求、回傳的結果
+  （文字要逐字相同，只遮掉 `provider`、`model` 的值）和錯誤；
+- 確認 FastMCP 版的 stdout 只有 MCP 訊息，以及引擎掛掉時回的是寫出原因的工具錯誤。
 
 最後一行是 `=== overall: PASS (0 failing) ===`、exit code 是 0。
 
@@ -380,7 +394,8 @@ FastMCP 版在 `jev_fastmcp.py`／`jev_lib.py` 裡，另一種做法在 jev-mcp 
 | `Jev request exceeded the 60000ms deadline.` | 慢引擎加上很多題（例如候選多的 `jev_rerank`）；調高 `JEV_MCP_REQUEST_TIMEOUT_MS` |
 | 401（端點） | 請求沒帶 token，或 `JEV_API_KEY` 跟 `SYSTEMONE_TOKEN` 不一樣 |
 | 工具回 `invalid_response` | 模型沒照格式回答（字母合計低於 `MIN_LABEL_MASS`），或選項數超過上限 |
-| `claude mcp list` 顯示連線失敗 | 路徑錯、`.venv` 沒裝套件，或環境變數不合法（錯誤訊息會指出是哪一個） |
+| `claude mcp list` 顯示連線失敗 | 路徑錯、`.venv` 沒裝套件，或環境變數不合法；直接執行註冊的指令，終端機會印出原因 |
+| FastMCP 版：`jev_extract needs the mini-racer package` | `.venv` 沒裝 `requirements-fastmcp.txt`，或這個平台沒有 mini-racer 的預編版本；其他 10 個工具不受影響 |
 
 `python3 check_engine.py` 會直接印出引擎呼叫失敗的原因，比看工具錯誤容易找問題。
 
@@ -410,7 +425,7 @@ FastMCP 版在 `jev_fastmcp.py`／`jev_lib.py` 裡，另一種做法在 jev-mcp 
   （例如 Claude Code），它讀到的內容仍然會送到那個模型的供應商。
 - **相依套件。** jev-mcp 的做法：`@jkudish/jev-mcp` 固定在 0.8.0，但它依賴的 `@typesafe-ai/sdk`、
   `@jkudish/jev-agent-tools`、`@modelcontextprotocol/sdk`、`zod` 用的是版本範圍。FastMCP 版：
-  `requirements-fastmcp.txt` 固定了 fastmcp 和 regex 的版本，它們自己的相依套件沒有鎖定。
+  `requirements-fastmcp.txt` 固定了 fastmcp 和 mini-racer 的版本，它們自己的相依套件沒有鎖定。
 - **FastMCP 版跟 jev-mcp 是分開的程式。** jev-mcp 之後改版，FastMCP 版不會跟著變；`parity_test.py`
   固定比對 0.8.0。
 
@@ -447,14 +462,14 @@ FastMCP 版在 `jev_fastmcp.py`／`jev_lib.py` 裡，另一種做法在 jev-mcp 
 ## 授權
 
 - `jev_fastmcp.py` 和 `jev_lib.py` 移植自 `@jkudish/jev-mcp` 0.8.0，適用它的 MIT 授權（Copyright (c) 2026 Joey Kudish）；
-  `jev_review`／`jev_gate` 的題目設計在上游改編自 burnigtm/jev-mcp（同為 MIT）。授權全文在 `LICENSES/jev-mcp.txt`，
-  複製或散布這兩個檔案時要一併附上。
+  `jev_review`／`jev_gate` 的題目設計在上游改編自 burnigtm/jev-mcp（MIT，Copyright (c) 2026 jev-mcp contributors）。
+  授權全文在 `LICENSES/jev-mcp.txt` 和 `LICENSES/burnigtm-jev-mcp.txt`，複製或散布這兩個檔案時要一併附上。
 - repo 其他部分目前沒有授權檔。沒有授權時預設保留所有權利：別人可以瀏覽程式碼，但沒有取得複製、修改
   或再散布的權利。要讓別人使用，請先加上授權。
-- 執行時依賴的 `@jkudish/jev-mcp`（MIT）由 `npx` 從 npm 下載，fastmcp（Apache-2.0）和 regex（Apache-2.0 AND CNRI-Python）由 pip 安裝，
-  都不包含在這個 repo 裡。
+- 執行時依賴的 `@jkudish/jev-mcp`（MIT）由 `npx` 從 npm 下載，fastmcp（Apache-2.0）和 mini-racer（ISC，內含 V8，
+  BSD-3-Clause）由 pip 安裝，都不包含在這個 repo 裡。
 
 ## 版本
 
-- 2026-09-26：新增 FastMCP 版（fastmcp 4.0.10），與 jev-mcp 0.8.0 的一致性測試通過。
+- 2026-09-26：新增 FastMCP 版（fastmcp 4.0.10、mini-racer 0.14.1），與 jev-mcp 0.8.0 的一致性測試通過。
 - 2026-09-25：相容端點與檢查工具，對應 `@jkudish/jev-mcp@0.8.0`。

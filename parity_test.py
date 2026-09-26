@@ -20,10 +20,13 @@ Exit 0 only if every check passes.
 """
 import io
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import threading
+import time
 import traceback
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -93,7 +96,7 @@ const out = cases.map(({document, pattern, flags}) => {
       candidates.push(v);
     }
     return {candidates, truncated, tooLong};
-  } catch (e) { return {error: true}; }
+  } catch (e) { return {candidates: [], truncated: false, tooLong: 0, error: String(e && e.message ? e.message : e)}; }
 });
 process.stdout.write(JSON.stringify(out));
 """
@@ -103,12 +106,22 @@ const vals = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 process.stdout.write(JSON.stringify(vals.map(v => [v.toFixed(2), v.toFixed(4), String(v)])));
 """
 
+JS_NUMBER_PARSE = r"""
+const s = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+process.stdout.write(JSON.stringify(s.map(x => { const n = Number(x); return Number.isNaN(n) ? 'NaN' : (Number.isFinite(n) ? n : String(n)); })));
+"""
+
+JS_STRINGIFY = r"""
+const v = JSON.parse(require('fs').readFileSync(0, 'utf8'));
+process.stdout.write(JSON.stringify(v.map(x => JSON.stringify(x, null, 2))));
+"""
+
 JS_TRIM = r"""
 const s = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 process.stdout.write(JSON.stringify(s.map(x => x.trim())));
 """
 
-# Divergences the port documents (none are expected for these cases).
+# mini-racer's V8 is newer than Node 22's: syntax Node 22 rejects may compile here.
 KNOWN_REGEX_DIVERGENCE = set()
 REGEX_CASES = [
     ("dot-excludes-cr", "a\rb a\nb a b axb", r"a.b", "g"),
@@ -145,6 +158,99 @@ REGEX_CASES = [
     ("invalid-flag", "x", r"x", "gx"),
 ]
 
+# Patterns an independent review found where a Python translation of
+# JavaScript regex diverged; V8 must match Node on every one.
+REVIEW_REGEX_CASES = [
+    ('class-W-underscore', 'café-bar_x', '[\\W_]+', 'g'),
+    ('letters-only-idiom', 'café naïve', '[^\\W\\d_]+', 'g'),
+    ('class-D', '１２3a', '[\\D]+', 'g'),
+    ('class-S', 'a\x85b\ufeffc\x1cd', '[\\S]+', 'g'),
+    ('w-dash-dot-email', 'mail john.doe-x@example.com now', '[\\w-.]+@[\\w-]+\\.\\w+', 'g'),
+    ('s-dash-z', 'a z-', '[\\s-z]+', 'g'),
+    ('d-dash-x', '1-x2', '[\\d-x]+', 'g'),
+    ('posix-class', 'abc a] x', '[[:alpha:]]+', 'g'),
+    ('empty-first-alternative', 'abc 123', '[a-z]*|\\d+', 'g'),
+    ('lazy-star', '12', '\\d*?', 'g'),
+    ('optional-quote-backref', "x=abc y='q'", '([\'\\"])?\\w+\\1', 'g'),
+    ('backref-nonparticipating', 'b', '(a)|b\\1', 'g'),
+    ('backref-forward', 'aa', '\\1(a)', 'g'),
+    ('surrogate-range-class', 'hi 😀 there', '[\\ud800-\\udbff][\\udc00-\\udfff]', 'g'),
+    ('surrogate-escape-pair', 'hi 😀', '😀', 'g'),
+    ('surrogate-escape-pair-u', 'hi 😀', '😀', 'gu'),
+    ('dot-astral', '😀a', '^.{2}', 'g'),
+    ('emoji-class-non-u', 'x😀', '[😀]', 'g'),
+    ('identity-escape-A', 'A1 Z', '\\A\\d', 'g'),
+    ('identity-escape-Z', 'xZ', 'x\\Z', 'g'),
+    ('identity-escape-a', 'a', '\\a', 'g'),
+    ('identity-escape-m', 'm', '\\m', 'g'),
+    ('identity-escape-y', 'y', '\\y', 'g'),
+    ('identity-escape-G', 'G', '\\G', 'g'),
+    ('identity-escape-K', 'aK', 'a\\K', 'g'),
+    ('identity-escape-X', 'X', '\\X', 'g'),
+    ('k-without-groups', 'k<a>', '\\k<a>', 'g'),
+    ('octal-no-group', '\x01', '\\1', 'g'),
+    ('escape-8', '8', '\\8', 'g'),
+    ('u-brace-non-u', 'uuu', '\\u{3}', 'g'),
+    ('x-incomplete', 'xZ', '\\xZ', 'g'),
+    ('kelvin-i', 'K k K', 'k', 'gi'),
+    ('long-s-i', 'ſ s', 's', 'gi'),
+    ('sharp-s-i', 'ẞ ß', 'ß', 'gi'),
+    ('w-i-long-s', 'ſ', '\\w', 'gi'),
+    ('b-i-long-s', 'ſx', '\\bx', 'gi'),
+    ('angstrom-i', 'Å å', 'å', 'gi'),
+    ('ohm-i', 'Ω ω', 'ω', 'gi'),
+    ('dotless-i', 'ı i I', 'i', 'gi'),
+    ('dotted-I', 'İ i', 'i', 'gi'),
+    ('iu-sharp-s', 'ẞ ß', 'ß', 'giu'),
+    ('iu-kelvin', 'K k', 'k', 'giu'),
+    ('v-intersection', 'abc', '[\\w&&[a-b]]', 'gv'),
+    ('v-subtraction', 'hello', '[a-z--[aeiou]]+', 'gv'),
+    ('v-string-literal', 'abc', '[\\q{abc}]', 'gv'),
+    ('dollar-group-name', 'x', '(?<$a>x)', 'g'),
+    ('quantified-lookahead', 'ab', '(?=a)?a', 'g'),
+    ('u-lone-brace', 'aaa', 'a{,2}', 'gu'),
+    ('quantifier-at-start', '{2}', '{2}', 'g'),
+    ('inline-flag', 'ABC', '(?i)abc', 'g'),
+    ('atomic-group', 'aab', '(?>a+)b', 'g'),
+    ('class-B-escape', 'B', '[\\B]', 'g'),
+    ('class-k-escape', 'k', '[\\k]', 'g'),
+    ('big-quantifier', 'x', 'x{99999999999}', 'g'),
+    ('hyphen-after-range', 'a-z', '[a-c-z]+', 'g'),
+    ('lookbehind-variable', 'price: $12 cost $3', '(?<=\\$\\s?)\\d+', 'g'),
+    ('caret-in-middle', 'a^b', 'a^b', 'g'),
+    ('dollar-in-middle-m', 'a\nb', 'a$\\n^b', 'gm'),
+    ('word-boundary-cjk', '中文abc', '\\babc', 'g'),
+    ('i-greek-sigma', 'ΣΑΣ σας', 'σας', 'gi'),
+    ('i-micro', 'µ μ', 'μ', 'gi'),
+    ('i-cherokee', 'Ꭰ ꭰ', 'ꭰ', 'gi'),
+    ('nul-escape', 'a\x00b', 'a\\0b', 'g'),
+    ('control-in-class', 'a\x08b', 'a[\\b]b', 'g'),
+    ('empty-class-negated-in-alt', 'ab', '[^]|x', 'g'),
+    ('nested-empty-class', 'a]', '[]]', 'g'),
+    ('backslash-dash-class', 'a-b', '[\\-]', 'g'),
+    ('s-with-nbsp', 'a\xa0b', 'a\\sb', 'g'),
+    ('S-plus-fw', 'ａｂ\u3000ｃ', '\\S+', 'g'),
+    ('i-fullwidth', 'ＡＢＣ ａｂｃ', 'ａｂｃ', 'gi'),
+    ('named-backref-u', 'abab', '(?<p>ab)\\k<p>', 'gu'),
+    ('p-L-u-class', 'Größe 42', '[\\p{L}\\d]+', 'gu'),
+    ('P-L-u', 'Größe 42', '\\P{L}+', 'gu'),
+    ('scx-property', 'abc αβγ', '\\p{scx=Grek}+', 'gu'),
+    ('lowercase-property', 'abc', '\\p{letter}+', 'gu'),
+    ('lookahead-dollar', 'ab\n', 'b(?=$)', 'g'),
+    ('dot-lf-in-class-s', 'a\nb', 'a[.]b', 'gs'),
+    ('m-caret-after-ls', 'x\u2028y', '^y', 'gm'),
+    ('d-flag', 'a1', '\\d', 'gd'),
+    ('any-s-S (NEL)', '<b>x\x85y</b>', '<b>[\\s\\S]*?</b>', 'g'),
+    ('any-s-S (x1c)', '<b>x\x1cy</b>', '<b>[\\s\\S]*?</b>', 'g'),
+    ('any-w-W (é)', '<b>café</b>', '<b>[\\w\\W]*?</b>', 'g'),
+    ('any-d-D (fullwidth)', '<b>１２</b>', '<b>[\\d\\D]*?</b>', 'g'),
+    ('any-s-S plain', '<b>x\ny</b>', '<b>[\\s\\S]*?</b>', 'g'),
+    ('non-space-class (NBSP)', 'a\xa0b', '[\\S]+', 'g'),
+    ('word-or-dash', 'naïve-x', '[\\W-]+', 'g'),
+    ('i-flag Kelvin in word', '5K run', '\\d+k', 'gi'),
+]
+ALL_REGEX_CASES = REGEX_CASES + [c for c in REVIEW_REGEX_CASES if c[0] not in {r[0] for r in REGEX_CASES}]
+
 
 def node(script, payload):
     proc = subprocess.run(["node", "-e", script], input=json.dumps(payload), capture_output=True, text=True, timeout=30)
@@ -165,16 +271,23 @@ def run_oracle_checks():
         check(f"String({v!r})", lib.js_number_str(v) == s, f"py {lib.js_number_str(v)} js {s}")
     samples = ["  a  ", "　x　", "﻿y﻿", "\x1cz\x1c", "\x85w\x85", " v ", "\t\n\v\f\r u       "]
     check("String.prototype.trim", [lib.js_trim(s) for s in samples] == node(JS_TRIM, samples))
-    cases = [{"document": d, "pattern": p, "flags": f} for _, d, p, f in REGEX_CASES]
+    numbers = ["", "  ", "12", " 12 ", "1e3", "1.0", "1.5", "0x10", "0o17", "0b11", "-4", "+7", ".5", "5.", "1_000", "\uff19", "Infinity", "-Infinity", "abc", "0x", "\u300012\u3000", "1e400"]
+    js_numbers = node(JS_NUMBER_PARSE, numbers)
+    for text, expected in zip(numbers, js_numbers):
+        got = lib.js_number(text)
+        got = "NaN" if got is None else ("Infinity" if got == math.inf else "-Infinity" if got == -math.inf else got)
+        check(f"Number({text!r})", got == expected, f"py {got!r} js {expected!r}")
+    payloads = [{"a": 1.0, "b": 0.1 + 0.2, "c": 1e-7, "d": [], "e": {}, "f": [1, [2, {"g": None}]], "h": "é\n\"\u2028", "i": True, "j": -0.0, "k": 1e21, "l": 5e-324}]
+    check("JSON.stringify(value, null, 2)", [lib.js_stringify(v) for v in payloads] == node(JS_STRINGIFY, payloads))
+    cases = [{"document": d, "pattern": p, "flags": f} for _, d, p, f in ALL_REGEX_CASES]
     js_out = node(JS_WORKER, cases)
-    for (name, doc, pattern, flags), expected in zip(REGEX_CASES, js_out):
+    for (name, doc, pattern, flags), expected in zip(ALL_REGEX_CASES, js_out):
         got = jev_fastmcp.run_regex(doc, pattern, flags)
-        got_cmp = {"error": True} if got.get("error") else {k: got[k] for k in ("candidates", "truncated", "tooLong")}
-        same = got_cmp == expected
+        same = got == expected
         if name in KNOWN_REGEX_DIVERGENCE:
-            print(f"[info] regex {name}: {'same' if same else 'differs (documented)'}  js={expected} py={got_cmp}")
+            print(f"[info] regex {name}: {'same' if same else 'differs (documented)'}  js={expected} py={got}")
         else:
-            check(f"regex {name}", same, f"js={expected} py={got_cmp}")
+            check(f"regex {name}", same, f"js={expected} py={got}")
 
 
 # ── Differential cases ────────────────────────────────────────────────────────
@@ -280,6 +393,18 @@ def normalize(payload):
     return out
 
 
+def normalize_text(text):
+    """The raw result text with only the top-level provider/model values masked."""
+    return re.sub(r'^  "(provider|model)": "[^"]*"', r'  "\1": "<masked>"', text, flags=re.M)
+
+
+def first_text_difference(a, b):
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return f"at char {i}: ...{a[max(0, i - 40):i + 40]!r} vs ...{b[max(0, i - 40):i + 40]!r}"
+    return f"lengths {len(a)} vs {len(b)}"
+
+
 def first_difference(a, b, path="$"):
     if type(a) is not type(b) and not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
         return f"{path}: {a!r} vs {b!r}"
@@ -359,10 +484,50 @@ def run_differential(engine):
                              + next((f"; first difference at #{i}" for i, (a, b) in enumerate(zip(ref_requests, port_requests)) if a != b), "")):
                     continue
                 diff = first_difference(normalize(ref_payload), normalize(port_payload))
-                check(f"{name}: result ({len(ref_requests)} engine calls)", diff is None, diff or "")
+                if check(f"{name}: result ({len(ref_requests)} engine calls)", diff is None, diff or ""):
+                    a, b = normalize_text(ref_text), normalize_text(port_text)
+                    check(f"{name}: result text byte-identical", a == b, first_text_difference(a, b))
     finally:
         for proc, what in ((ref, "jev-mcp"), (port, "jev_fastmcp"), (sys1, "systemone_local")):
             ct.terminate(proc, what)
+
+
+def run_stdout_check(engine):
+    """Every line the port writes to stdout must be a JSON-RPC message, also
+    while jev_extract starts V8 and while tools run."""
+    print("\n=== port: stdout carries only JSON-RPC ===")
+    engine.set_mode("confident")
+    env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", ""), "ENGINE_URL": engine.url}
+    proc = ct.spawn([sys.executable, str(HERE / "jev_fastmcp.py")], env, cwd=str(HERE),
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+    lines = []
+    reader = threading.Thread(target=lambda: [lines.append(line) for line in proc.stdout], daemon=True)
+    reader.start()
+    messages = [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "stdout-check", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "jev_extract", "arguments": ct.TOOL_INPUTS["jev_extract"]}},
+        {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "jev_verify", "arguments": ct.TOOL_INPUTS["jev_verify"]}},
+    ]
+    try:
+        for message in messages:
+            proc.stdin.write(json.dumps(message) + "\n")
+            proc.stdin.flush()
+        deadline = time.time() + 60
+        while time.time() < deadline and sum(1 for line in lines if '"id"' in line) < 4:
+            time.sleep(0.1)
+        parsed = []
+        for line in lines:
+            try:
+                parsed.append(json.loads(line))
+            except json.JSONDecodeError:
+                parsed.append(None)
+        ok = all(isinstance(m, dict) and m.get("jsonrpc") == "2.0" for m in parsed)
+        answered = sorted(m["id"] for m in parsed if isinstance(m, dict) and "id" in m)
+        check("stdout is JSON-RPC only", ok and answered == [1, 2, 3, 4], f"{len(lines)} lines, answered ids {answered}, non-JSON: {[l for l, m in zip(lines, parsed) if m is None][:3]}")
+    finally:
+        ct.terminate(proc, "jev_fastmcp (stdout check)")
 
 
 def run_dead_engine_check():
@@ -382,7 +547,7 @@ def run_dead_engine_check():
 
 def main():
     engine = CaptureEngine()
-    for step in (run_oracle_checks, lambda: run_differential(engine), run_dead_engine_check):
+    for step in (run_oracle_checks, lambda: run_differential(engine), lambda: run_stdout_check(engine), run_dead_engine_check):
         try:
             step()
         except Exception:

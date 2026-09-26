@@ -1,2 +1,2 @@
 fastmcp==4.0.10
-regex==2026.9.10
+mini-racer==0.14.1

@@ -20,29 +20,43 @@ TOP_LOGPROBS, MIN_LABEL_MASS, ENGINE_EXTRA_BODY, ENGINE_TIMEOUT_S), plus
                               default 3
 
 Deliberate differences from jev-mcp 0.8.0:
-- Results report provider "local" and ENGINE_MODEL as the model.
+- Results report provider "local" (or "none" when jev_extract needs no model
+  call, as upstream) and ENGINE_MODEL as the model.
 - A failed engine call is retried on its own rather than the whole request,
   and an engine that keeps failing surfaces as a tool error naming the cause
   (unreachable, an HTTP status, or a reply without usable logprobs).
-- jev_extract translates each JavaScript pattern for Python's `regex` engine
-  (translate_js_pattern) and runs it with a 1 s timeout instead of in a
-  JavaScript worker. Syntax only one engine accepts (e.g. Python's (?P<name>)
-  or possessive quantifiers, JavaScript's \\c escapes) behaves differently,
-  and an invalid pattern's reason carries this engine's error text.
-- String lengths count Unicode code points (JavaScript counts UTF-16 units).
-- Optional arguments also accept null, meaning "omitted".
+- The JEV_MCP_REQUEST_TIMEOUT_MS deadline is checked before each engine call,
+  so a call can run past it by up to one engine attempt (ENGINE_TIMEOUT_S);
+  a client's cancellation does not stop an engine call already in flight.
+- jev_extract's patterns run in V8 through mini-racer instead of Node's V8 in
+  a worker. Matching is JavaScript's; mini-racer's V8 is newer than Node 22's,
+  so a few newer syntax features (e.g. (?i:...) modifiers) are accepted here
+  and rejected by Node 22, and timeouts can fire at slightly different times.
+- String length limits and truncation count Unicode code points (JavaScript
+  counts UTF-16 units); only characters outside the BMP count differently.
+- Input validation: optional arguments and nested optional ids also accept
+  null, meaning "omitted"; integer fields reject 5.0 and objects reject a
+  "__proto__" key, both of which jev-mcp's zod accepts.
+- jev_classify's by_class counts class ids named after Object.prototype
+  members ("constructor", "toString") normally; jev-mcp 0.8.0 mangles them.
 - Tool descriptions name the local model instead of TypeSafe Jev, drop
-  TypeSafe's benchmark and calibration claims, and state this server's
-  options-per-question cap.
+  TypeSafe's benchmark and calibration claims, state this server's
+  options-per-question cap, and (jev_rerank) note one engine call per
+  candidate. The server sends MCP instructions and marks every tool
+  readOnlyHint true and openWorldHint false.
+- A tools/call whose arguments contain a lone UTF-16 surrogate gets no reply
+  (dropped by the MCP Python SDK); jev-mcp answers it.
 
-Ported from @jkudish/jev-mcp 0.8.0 (MIT, Copyright (c) Joey Kudish); see
-LICENSES/jev-mcp.txt.
+Ported from @jkudish/jev-mcp 0.8.0 (MIT, Copyright (c) 2026 Joey Kudish); see
+LICENSES/jev-mcp.txt, and LICENSES/burnigtm-jev-mcp.txt for the jev_review /
+jev_gate question design upstream adapted from burnigtm/jev-mcp.
 """
 import json
 import math
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 from pathlib import Path
@@ -50,7 +64,6 @@ from typing import Annotated, Any, Optional, Union
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import regex  # noqa: E402
 from fastmcp import FastMCP  # noqa: E402
 from fastmcp.exceptions import ToolError  # noqa: E402
 from fastmcp.tools.base import ToolResult  # noqa: E402
@@ -60,6 +73,11 @@ from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
 import jev_lib as lib  # noqa: E402
 import systemone_local as s1  # noqa: E402
 
+try:
+    from py_mini_racer import JSTimeoutException, MiniRacer
+except ImportError:  # only jev_extract needs it; it reports the missing package
+    JSTimeoutException = MiniRacer = None
+
 SERVER_VERSION = "0.1.0"
 PROVIDER = "local"
 # Options one question can carry: one letter each, within the engine's
@@ -68,12 +86,13 @@ LABEL_CAP = s1.MAX_DIRECT_LABELS
 
 
 def _positive_int_env(name, fallback):
-    """jev-mcp's positiveIntFromEnv: a positive integer, else the fallback."""
-    try:
-        value = float(os.environ.get(name, ""))
-    except ValueError:
+    """jev-mcp's positiveIntFromEnv: Number(value) if it is a positive
+    integer, else the fallback."""
+    raw = os.environ.get(name)
+    value = None if raw is None else lib.js_number(raw)
+    if value is None or not math.isfinite(value) or value != int(value) or value <= 0:
         return fallback
-    return int(value) if math.isfinite(value) and value.is_integer() and value > 0 else fallback
+    return int(value)
 
 
 REQUEST_TIMEOUT_MS = _positive_int_env("JEV_MCP_REQUEST_TIMEOUT_MS", 60_000)
@@ -149,21 +168,9 @@ def score(instructions, criteria):
     return {"type": "score", "instructions": instructions, "criteria": criteria}
 
 
-def _json_safe(value):
-    """JSON.stringify prints non-finite numbers as null."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if isinstance(value, list):
-        return [_json_safe(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _json_safe(v) for k, v in value.items()}
-    return value
-
-
 def _result(payload, is_error=False):
-    """jev-mcp's text(): the payload as indented JSON in one text block."""
-    body = json.dumps(_json_safe(payload), indent=2, ensure_ascii=False)
-    return ToolResult(content=[TextContent(type="text", text=body)], is_error=is_error)
+    """jev-mcp's text(): the payload as JSON.stringify(payload, null, 2) in one text block."""
+    return ToolResult(content=[TextContent(type="text", text=lib.js_stringify(payload))], is_error=is_error)
 
 
 # ── Input shapes (jev-mcp's zod schemas; nested objects are strict) ───────────
@@ -867,149 +874,65 @@ def jev_compare(
 # ─────────────────────────────────────────────────────────────────────────────
 # jev_extract
 # ─────────────────────────────────────────────────────────────────────────────
-_JS_FLAGS = set("dgimsuvy")
-_WORD = "A-Za-z0-9_"
-# JavaScript's WhiteSpace and LineTerminator characters (what its \s matches).
-_JS_SPACE = "\t\n\v\f\r    -     　﻿"
-_LINE_END = "\n\r  "
-_ESCAPES_OUTSIDE_CLASS = {
-    "d": "[0-9]", "D": "[^0-9]",
-    "w": f"[{_WORD}]", "W": f"[^{_WORD}]",
-    "s": f"[{_JS_SPACE}]", "S": f"[^{_JS_SPACE}]",
-    "b": f"(?:(?<=[{_WORD}])(?![{_WORD}])|(?<![{_WORD}])(?=[{_WORD}]))",
-    "B": f"(?:(?<=[{_WORD}])(?=[{_WORD}])|(?<![{_WORD}])(?![{_WORD}]))",
-}
-_ESCAPES_INSIDE_CLASS = {"d": "0-9", "w": _WORD, "s": _JS_SPACE}
-_JS_QUANTIFIER = re.compile(r"\{\d+(?:,\d*)?\}")
-
-
-def translate_js_pattern(pattern, flags):
-    """Rewrite a JavaScript regex so Python's `regex` engine matches what
-    JavaScript would: ASCII \\d \\w \\b, JavaScript's \\s set, its line
-    terminators for . ^ $, a literal { that is not a quantifier and a literal
-    \\p without the u/v flag, [] and [^], \\k<name>, and \\u{...}. The m and s
-    flags are applied here; only i is left to the engine."""
-    unicode_mode = "u" in flags or "v" in flags
-    multiline = "m" in flags
-    dotall = "s" in flags
-    out = []
-    in_class = False
-    i = 0
-    n = len(pattern)
-    while i < n:
-        ch = pattern[i]
-        if ch == "\\" and i + 1 < n:
-            nxt = pattern[i + 1]
-            table = _ESCAPES_INSIDE_CLASS if in_class else _ESCAPES_OUTSIDE_CLASS
-            if nxt in table:
-                out.append(table[nxt])
-                i += 2
-                continue
-            if nxt == "k" and not in_class and pattern.startswith("<", i + 2):
-                end = pattern.find(">", i + 3)
-                if end != -1:
-                    out.append(f"(?P={pattern[i + 3:end]})")
-                    i = end + 1
-                    continue
-            if nxt == "u" and unicode_mode and pattern.startswith("{", i + 2) and pattern.find("}", i + 3) != -1:
-                end = pattern.find("}", i + 3)
-                try:
-                    out.append(regex.escape(chr(int(pattern[i + 3:end], 16))))
-                    i = end + 1
-                    continue
-                except ValueError:
-                    pass
-            if nxt in "pP" and not unicode_mode:
-                out.append(nxt)  # without u/v, \p is an identity escape
-            else:
-                out.append(pattern[i:i + 2])
-            i += 2
-            continue
-        if in_class:
-            if ch == "]":
-                in_class = False
-            out.append(ch)
-            i += 1
-            continue
-        if ch == "[":
-            if pattern.startswith("[]", i):
-                out.append("(?!)")  # JavaScript's empty class matches nothing
-                i += 2
-                continue
-            if pattern.startswith("[^]", i):
-                out.append("(?s:.)")  # and its negation matches anything
-                i += 3
-                continue
-            in_class = True
-            out.append("[^" if pattern.startswith("[^", i) else "[")
-            i += 2 if pattern.startswith("[^", i) else 1
-            continue
-        if ch == ".":
-            out.append("(?s:.)" if dotall else f"[^{_LINE_END}]")
-        elif ch == "^":
-            out.append(f"(?:\\A|(?<=[{_LINE_END}]))" if multiline else "\\A")
-        elif ch == "$":
-            out.append(f"(?=[{_LINE_END}]|\\Z)" if multiline else "\\Z")
-        elif ch == "{" and not unicode_mode:
-            quantifier = _JS_QUANTIFIER.match(pattern, i)
-            if quantifier is None:
-                out.append("\\{")
-            else:
-                out.append(quantifier.group(0))
-                i = quantifier.end()
-                continue
-        else:
-            out.append(ch)
-        i += 1
-    return "".join(out)
+# jev-mcp runs caller patterns with JavaScript's RegExp in a worker thread
+# under a hard deadline. The same worker logic runs here in V8 (the engine
+# Node uses) through mini-racer, so matching, error text and UTF-16 lengths
+# follow JavaScript exactly.
+REGEX_WORKER_SOURCE = """(() => {
+  const { document, pattern, flags, maxCandidates, maxCandidateChars } = __INPUT__;
+  try {
+    const re = new RegExp(pattern, flags);
+    const seen = new Set();
+    const candidates = [];
+    let truncated = false;
+    let tooLong = 0;
+    for (const match of document.matchAll(re)) {
+      const value = match[0];
+      if (value.length === 0 || seen.has(value)) continue;
+      seen.add(value);
+      if (value.length > maxCandidateChars) { tooLong += 1; continue; }
+      if (candidates.length >= maxCandidates) { truncated = true; break; }
+      candidates.push(value);
+    }
+    return JSON.stringify({ candidates, truncated, tooLong });
+  } catch (error) {
+    return JSON.stringify({ candidates: [], truncated: false, tooLong: 0, error: String(error && error.message ? error.message : error) });
+  }
+})()"""
+_v8 = None
+_v8_lock = threading.Lock()
 
 
 def run_regex(document, pattern, flags):
-    """jev-mcp's REGEX_WORKER_SOURCE: unique non-empty matches in order,
-    overlong ones skipped and counted, capped at MAX_EXTRACT_CANDIDATES, all
-    under a hard deadline."""
-    def failed(message):
-        return {"candidates": [], "truncated": False, "tooLong": 0, "error": message}
-    if any(f not in _JS_FLAGS for f in flags) or len(set(flags)) != len(flags) or ("u" in flags and "v" in flags):
-        return failed(f"Invalid flags supplied to RegExp constructor '{flags}'")
-    try:
-        compiled = regex.compile(translate_js_pattern(pattern, flags), regex.IGNORECASE if "i" in flags else 0)
-    except (regex.error, ValueError, OverflowError) as exc:
-        return failed(f"Invalid regular expression: /{pattern}/{flags}: {exc}")
-    sticky = "y" in flags
-    seen = set()
-    candidates = []
-    truncated = False
-    too_long = 0
-    expected_start = 0
-    try:
-        for match in compiled.finditer(document, timeout=lib.REGEX_TIMEOUT_MS / 1000):
-            if sticky:
-                # y: each match must start where the previous one ended.
-                if match.start() != expected_start:
-                    break
-                expected_start = match.end() if match.end() > match.start() else match.end() + 1
-            value = match.group(0)
-            if not value or value in seen:
-                continue
-            seen.add(value)
-            if len(value) > lib.MAX_EXTRACT_CANDIDATE_CHARS:
-                too_long += 1
-                continue
-            if len(candidates) >= lib.MAX_EXTRACT_CANDIDATES:
-                truncated = True
-                break
-            candidates.append(value)
-    except TimeoutError:
-        return failed(f"regex timed out after {lib.REGEX_TIMEOUT_MS}ms; simplify the pattern")
-    return {"candidates": candidates, "truncated": truncated, "tooLong": too_long}
+    """jev-mcp's regex worker: unique non-empty matches in order, overlong
+    ones skipped and counted, capped at MAX_EXTRACT_CANDIDATES, under a hard
+    deadline. Returns {candidates, truncated, tooLong[, error]}."""
+    global _v8
+    if MiniRacer is None:
+        raise ToolError("jev_extract needs the mini-racer package (pip install -r requirements-fastmcp.txt).")
+    source = REGEX_WORKER_SOURCE.replace("__INPUT__", json.dumps({
+        "document": document, "pattern": pattern, "flags": flags,
+        "maxCandidates": lib.MAX_EXTRACT_CANDIDATES, "maxCandidateChars": lib.MAX_EXTRACT_CANDIDATE_CHARS,
+    }))
+    with _v8_lock:
+        if _v8 is None:
+            _v8 = MiniRacer()
+        try:
+            return json.loads(_v8.eval(source, timeout_sec=lib.REGEX_TIMEOUT_MS / 1000))
+        except JSTimeoutException:
+            _v8 = None  # the next field starts from a fresh context
+            message = f"regex timed out after {lib.REGEX_TIMEOUT_MS}ms; simplify the pattern"
+        except Exception as exc:  # noqa: BLE001 -- e.g. out of memory: the field fails, the server does not
+            _v8 = None
+            message = str(exc) or type(exc).__name__
+    return {"candidates": [], "truncated": False, "tooLong": 0, "error": message}
 
 
 class ExtractField(_Strict):
     id: Annotated[str, Field(pattern=SLUG, max_length=64, description="Field name, e.g. 'price' or 'version'.")]
     pattern: Annotated[str, Field(min_length=1, max_length=500, description=(
-        "JavaScript regex source (without delimiters) that matches candidate values. Translated for Python's regex "
-        "engine with JavaScript semantics and run with a hard timeout."))]
+        "JavaScript regex source (without delimiters) that matches candidate values. Runs in a sandboxed V8 "
+        "context with a hard timeout."))]
     flags: Annotated[Optional[str], Field(max_length=8, description="Regex flags (e.g. 'i'). 'g' is always added; non-letters are dropped.")] = None
     description: Annotated[str, Field(min_length=1, max_length=2000, description="What the field is, so the model can pick the right candidate among regex matches.")]
 

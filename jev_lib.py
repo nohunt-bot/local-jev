@@ -12,6 +12,7 @@ counted in Unicode code points, where JavaScript counts UTF-16 code units.
 The two agree except for characters outside the Basic Multilingual Plane
 (emoji, some rare CJK), which count as 1 here and 2 upstream.
 """
+import json
 import math
 import re
 from decimal import ROUND_HALF_UP, Decimal
@@ -138,12 +139,62 @@ def js_json_normalize(value):
     if isinstance(value, bool) or value is None or isinstance(value, (str, int)):
         return value
     if isinstance(value, float):
-        return int(value) if value.is_integer() and abs(value) < 2**53 else value
+        return int(value) if value.is_integer() and abs(value) < 1e21 else value
     if isinstance(value, list):
         return [js_json_normalize(v) for v in value]
     if isinstance(value, dict):
         return {k: js_json_normalize(v) for k, v in value.items()}
     return value
+
+
+def js_stringify(value, _level=0):
+    """JSON.stringify(value, null, 2): json.dumps(indent=2)'s layout, with
+    numbers printed as JavaScript prints them and non-finite numbers as null."""
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (int, float)):
+        return js_number_str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    pad = "  " * (_level + 1)
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return "[]"
+        return "[\n" + ",\n".join(pad + js_stringify(v, _level + 1) for v in value) + "\n" + "  " * _level + "]"
+    if isinstance(value, dict):
+        if not value:
+            return "{}"
+        body = ",\n".join(pad + json.dumps(str(k), ensure_ascii=False) + ": " + js_stringify(v, _level + 1) for k, v in value.items())
+        return "{\n" + body + "\n" + "  " * _level + "}"
+    raise TypeError(f"not JSON-serializable: {type(value).__name__}")
+
+
+_JS_SPACE_CLASS = "[\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff]*"
+_JS_NUMBER = re.compile(
+    rf"^{_JS_SPACE_CLASS}(?:(?P<hex>0[xX][0-9a-fA-F]+)|(?P<oct>0[oO][0-7]+)|(?P<bin>0[bB][01]+)"
+    rf"|(?P<inf>[+-]?Infinity)|(?P<dec>[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?))?{_JS_SPACE_CLASS}$")
+
+
+def js_number(text):
+    """Number(text) for a string: None where JavaScript gives NaN."""
+    m = _JS_NUMBER.match(text)
+    if m is None:
+        return None
+    if m.group("hex"):
+        return int(m.group("hex"), 16)
+    if m.group("oct"):
+        return int(m.group("oct")[2:], 8)
+    if m.group("bin"):
+        return int(m.group("bin")[2:], 2)
+    if m.group("inf"):
+        return -math.inf if m.group("inf").startswith("-") else math.inf
+    if m.group("dec"):
+        return float(m.group("dec"))
+    return 0  # empty or whitespace only
 
 
 # String.prototype.trim removes WhiteSpace (TAB, VT, FF, ZWNBSP, category Zs)
