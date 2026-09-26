@@ -134,17 +134,37 @@ def js_object(mapping):
 
 
 def js_json_normalize(value):
-    """What a JSON round trip through JavaScript does to numbers: integral
-    floats become integers (JS has one number type, so 1.0 prints as 1)."""
-    if isinstance(value, bool) or value is None or isinstance(value, (str, int)):
+    """What a JSON round trip through JavaScript leaves of a value, as Python
+    reads it back: every number becomes a double (so integers above 2**53
+    lose precision), integral doubles below 1e21 print as integers with
+    JavaScript's digits, and non-finite numbers become null."""
+    if isinstance(value, bool) or value is None or isinstance(value, str):
         return value
-    if isinstance(value, float):
-        return int(value) if value.is_integer() and abs(value) < 1e21 else value
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        if not math.isfinite(number):
+            return None
+        if number.is_integer() and abs(number) < 1e21:
+            return int(Decimal(repr(number)))
+        return number
     if isinstance(value, list):
         return [js_json_normalize(v) for v in value]
     if isinstance(value, dict):
         return {k: js_json_normalize(v) for k, v in value.items()}
     return value
+
+
+_LONE_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def js_json_string(text):
+    """JSON.stringify(text) for a string: json.dumps without ASCII escaping,
+    except that lone UTF-16 surrogates (a JavaScript match can split an
+    emoji) are written as \\udXXX escapes instead of raw, unencodable code points."""
+    return _LONE_SURROGATE.sub(lambda m: "\\u%04x" % ord(m.group()), json.dumps(text, ensure_ascii=False))
 
 
 def js_stringify(value, _level=0):
@@ -159,7 +179,7 @@ def js_stringify(value, _level=0):
     if isinstance(value, (int, float)):
         return js_number_str(value)
     if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
+        return js_json_string(value)
     pad = "  " * (_level + 1)
     if isinstance(value, (list, tuple)):
         if not value:
@@ -168,7 +188,7 @@ def js_stringify(value, _level=0):
     if isinstance(value, dict):
         if not value:
             return "{}"
-        body = ",\n".join(pad + json.dumps(str(k), ensure_ascii=False) + ": " + js_stringify(v, _level + 1) for k, v in value.items())
+        body = ",\n".join(pad + js_json_string(str(k)) + ": " + js_stringify(v, _level + 1) for k, v in value.items())
         return "{\n" + body + "\n" + "  " * _level + "}"
     raise TypeError(f"not JSON-serializable: {type(value).__name__}")
 

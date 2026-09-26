@@ -20,7 +20,7 @@ TypeSafe 的關係），把 Jev 包成 11 個 MCP（Model Context Protocol）工
 
 > **狀態：研究用參考實作，不是正式服務。**
 > 整合路徑已用模擬引擎驗證：11 個工具都回傳有效判定；模型沒照格式回答時（選項字母合計低於 0.5），11 個工具都安全失敗。
-> FastMCP 版和 jev-mcp 0.8.0 在一致性測試裡（模擬引擎、兩種模式、43 種輸入加 15 種錯誤輸入）完全一致，回傳的文字逐字相同。
+> FastMCP 版和 jev-mcp 0.8.0 在一致性測試裡（模擬引擎、兩種模式、46 種輸入加 15 種錯誤輸入）完全一致，回傳的文字逐字相同。
 > **還沒接過真的推論引擎**，判斷品質、校準和速度都還沒測。
 
 ## 快速開始（Mac mini 等 Apple Silicon 的 Mac，FastMCP 版）
@@ -74,7 +74,8 @@ claude mcp list            # jev-local 要顯示 Connected
 
 - Linux 或 macOS。Windows 請用 WSL：`contract_test.py` 用到 POSIX 的程序群組，下面的指令也是 bash 寫法。
 - Python 3.10 以上（3.10、3.13 都跑過相容測試）。FastMCP 版要另外裝 `requirements-fastmcp.txt`，其中 mini-racer
-  內建 V8，讓 `jev_extract` 用 JavaScript 跑正規表示式（有 macOS、glibc 2.27 以上的 Linux 和 Windows 的預編版本）；
+  內建 V8，讓 `jev_extract` 用 JavaScript 跑正規表示式（預編版本涵蓋 macOS、Windows、glibc 2.27 以上或 musl 的
+  Linux；其他平台 `pip install` 會整個失敗）；
   相容端點只用標準函式庫（「接上推論引擎」裡的 tokenizer 檢查需要 `transformers`）。
 - 接真模型時：一個支援 `logprobs` 和 `top_logprobs` 的 OpenAI 相容推論引擎。
 - 註冊用 Claude Code 的 `claude` 指令（其他 MCP 用戶端也可以）；相容端點的試打用 `curl`。
@@ -212,10 +213,12 @@ MIN_LABEL_MASS=0 .venv/bin/python jev_fastmcp.py
   正在跑的引擎呼叫。
 - `jev_extract` 的正規表示式跟 jev-mcp 一樣在 V8 裡執行（jev-mcp 用 Node 裡的 V8，這裡透過 mini-racer），
   比對結果和錯誤訊息跟 JavaScript 相同。mini-racer 的 V8 比 Node 22 新，少數較新的語法（例如 `(?i:…)`）
-  這裡能用、Node 22 會報錯；逾時的時間點也可能略有不同。
+  這裡能用、Node 22 會報錯；逾時的時間點也可能略有不同。Unicode 資料則比較舊：mini-racer 0.14.1 內建
+  ICU 77（Unicode 16），Node 22.22 是 ICU 78（Unicode 17），所以 `\p{…}` 和不分大小寫的比對，遇到 Unicode 17
+  新增或改過的字元時結果不同（例如 `\p{Extended_Pictographic}` 在這裡會比對到 ★，Node 22.22 不會）。
 - 字串長度的上限和截斷以 Unicode 字元計算，JavaScript 以 UTF-16 單位計算；只有表情符號這類字元會算得不同。
-- 參數檢查：選填參數（包括項目裡選填的 `id`）也接受 `null`（視同沒填）；整數參數不接受 `5.0`，物件不接受
-  `__proto__` 這個鍵，jev-mcp 兩者都接受（只有非 JavaScript 的用戶端會送出這些）。
+- 參數檢查：選填參數（包括項目裡選填的 `id`）也接受 `null`（視同沒填）；整數參數不接受 `5.0`（jev-mcp 接受）；
+  最外層多一個 `__proto__` 參數時這裡會報錯，jev-mcp 會直接忽略它。
 - `jev_classify` 的 `by_class`：類別 id 剛好叫 `constructor`、`toString` 這類名稱時照常計數；jev-mcp 0.8.0 會算錯。
 - 工具說明把「TypeSafe Jev」改成本機模型，拿掉 TypeSafe 的基準測試和「已校準」的說法，寫出這個 server
   一題最多幾個選項（超過會回 `invalid_response`），`jev_rerank` 另外註明每個候選是一次引擎呼叫。server 會送出
@@ -232,9 +235,9 @@ MIN_LABEL_MASS=0 .venv/bin/python jev_fastmcp.py
 需要 Node.js 22 以上（會用 `npx` 跑 jev-mcp 0.8.0 當對照）。它會：
 
 - 用 Node 驗證移植的 JavaScript 行為：`toFixed`、數字轉字串、`Number()`、`JSON.stringify`、`trim`，以及
-  119 個正規表示式樣式的比對結果和錯誤訊息；
+  123 個正規表示式樣式的比對結果和錯誤訊息（其中 2 個是上面說的 Unicode 17 差異，只印 `[info]`、不算失敗）；
 - 比對兩邊的工具清單和參數；
-- 把 58 種輸入（43 種正常、15 種錯誤）在兩種引擎模式下送進兩條路，比對送給引擎的請求、回傳的結果
+- 把 61 種輸入（46 種正常、15 種錯誤）在兩種引擎模式下送進兩條路，比對送給引擎的請求、回傳的結果
   （文字要逐字相同，只遮掉 `provider`、`model` 的值）和錯誤；
 - 確認 FastMCP 版的 stdout 只有 MCP 訊息，以及引擎掛掉時回的是寫出原因的工具錯誤。
 
@@ -394,8 +397,9 @@ FastMCP 版在 `jev_fastmcp.py`／`jev_lib.py` 裡，另一種做法在 jev-mcp 
 | `Jev request exceeded the 60000ms deadline.` | 慢引擎加上很多題（例如候選多的 `jev_rerank`）；調高 `JEV_MCP_REQUEST_TIMEOUT_MS` |
 | 401（端點） | 請求沒帶 token，或 `JEV_API_KEY` 跟 `SYSTEMONE_TOKEN` 不一樣 |
 | 工具回 `invalid_response` | 模型沒照格式回答（字母合計低於 `MIN_LABEL_MASS`），或選項數超過上限 |
-| `claude mcp list` 顯示連線失敗 | 路徑錯、`.venv` 沒裝套件，或環境變數不合法；直接執行註冊的指令，終端機會印出原因 |
-| FastMCP 版：`jev_extract needs the mini-racer package` | `.venv` 沒裝 `requirements-fastmcp.txt`，或這個平台沒有 mini-racer 的預編版本；其他 10 個工具不受影響 |
+| `claude mcp list` 顯示連線失敗 | 路徑錯、`.venv` 沒裝套件（在沒有 mini-racer 預編版本的平台上，`pip install -r requirements-fastmcp.txt` 會整個失敗、什麼都沒裝），或環境變數不合法；直接執行註冊的指令，終端機會印出原因 |
+| FastMCP 版：`jev_extract needs the mini-racer package` | 裝了 fastmcp 卻沒裝 mini-racer（例如只單獨裝了 fastmcp）；重新執行 `.venv/bin/pip install -r requirements-fastmcp.txt`。其他 10 個工具不受影響 |
+| FastMCP 版：`jev_extract could not start V8 (mini-racer): …` | mini-racer 裝了，但它內建的 V8 在這台機器上載不起來，冒號後面是原因。其他 10 個工具不受影響 |
 
 `python3 check_engine.py` 會直接印出引擎呼叫失敗的原因，比看工具錯誤容易找問題。
 

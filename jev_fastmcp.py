@@ -32,11 +32,16 @@ Deliberate differences from jev-mcp 0.8.0:
   a worker. Matching is JavaScript's; mini-racer's V8 is newer than Node 22's,
   so a few newer syntax features (e.g. (?i:...) modifiers) are accepted here
   and rejected by Node 22, and timeouts can fire at slightly different times.
+  Its Unicode data is older: mini-racer 0.14.1 bundles ICU 77 (Unicode 16),
+  Node 22.22 has ICU 78 (Unicode 17), so \\p{...} classes and case-insensitive
+  matching differ for characters Unicode 17 added or changed (e.g.
+  \\p{Extended_Pictographic} matches U+2605 here, not in Node 22.22).
 - String length limits and truncation count Unicode code points (JavaScript
   counts UTF-16 units); only characters outside the BMP count differently.
 - Input validation: optional arguments and nested optional ids also accept
-  null, meaning "omitted"; integer fields reject 5.0 and objects reject a
-  "__proto__" key, both of which jev-mcp's zod accepts.
+  null, meaning "omitted"; integer fields reject 5.0, which jev-mcp's zod
+  accepts; a top-level "__proto__" argument is rejected here and silently
+  ignored by jev-mcp.
 - jev_classify's by_class counts class ids named after Object.prototype
   members ("constructor", "toString") normally; jev-mcp 0.8.0 mangles them.
 - Tool descriptions name the local model instead of TypeSafe Jev, drop
@@ -573,7 +578,10 @@ def jev_classify(
         raise ToolError(f"Batch too large: {len(item_rows)} items x {len(class_rows)} classes exceeds the 8,000 item-class budget. Split the batch.")
     state = {
         "purpose": "Assign each item to exactly one class." if purpose is None else purpose,
-        "context": None if context is None else lib.js_json_normalize(context),
+        # zod skips a "__proto__" key when it builds the record, so jev-mcp
+        # drops one at the top level (nested ones pass through z.any()).
+        "context": None if context is None else lib.js_json_normalize(
+            {k: v for k, v in context.items() if k != "__proto__"} if isinstance(context, dict) else context),
         "classes": [{"id": c["key"], "description": c["description"]} for c in class_rows],
     }
     criteria = {c["key"]: None for c in class_rows}
@@ -877,9 +885,10 @@ def jev_compare(
 # jev-mcp runs caller patterns with JavaScript's RegExp in a worker thread
 # under a hard deadline. The same worker logic runs here in V8 (the engine
 # Node uses) through mini-racer, so matching, error text and UTF-16 lengths
-# follow JavaScript exactly.
-REGEX_WORKER_SOURCE = """(() => {
-  const { document, pattern, flags, maxCandidates, maxCandidateChars } = __INPUT__;
+# follow JavaScript's. The function is compiled once and takes its input as
+# JSON, so no call adds a script to the context.
+REGEX_WORKER_SOURCE = """(function (input) {
+  const { document, pattern, flags, maxCandidates, maxCandidateChars } = JSON.parse(input);
   try {
     const re = new RegExp(pattern, flags);
     const seen = new Set();
@@ -898,32 +907,48 @@ REGEX_WORKER_SOURCE = """(() => {
   } catch (error) {
     return JSON.stringify({ candidates: [], truncated: false, tooLong: 0, error: String(error && error.message ? error.message : error) });
   }
-})()"""
+})"""
 _v8 = None
+_v8_worker = None
 _v8_lock = threading.Lock()
+
+
+def _drop_v8():
+    global _v8, _v8_worker
+    context, _v8, _v8_worker = _v8, None, None
+    if context is not None:
+        try:
+            context.close()
+        except Exception:  # noqa: BLE001 -- a broken context is replaced either way
+            pass
 
 
 def run_regex(document, pattern, flags):
     """jev-mcp's regex worker: unique non-empty matches in order, overlong
     ones skipped and counted, capped at MAX_EXTRACT_CANDIDATES, under a hard
     deadline. Returns {candidates, truncated, tooLong[, error]}."""
-    global _v8
+    global _v8, _v8_worker
     if MiniRacer is None:
         raise ToolError("jev_extract needs the mini-racer package (pip install -r requirements-fastmcp.txt).")
-    source = REGEX_WORKER_SOURCE.replace("__INPUT__", json.dumps({
+    payload = json.dumps({
         "document": document, "pattern": pattern, "flags": flags,
         "maxCandidates": lib.MAX_EXTRACT_CANDIDATES, "maxCandidateChars": lib.MAX_EXTRACT_CANDIDATE_CHARS,
-    }))
+    })
     with _v8_lock:
-        if _v8 is None:
-            _v8 = MiniRacer()
+        if _v8_worker is None:
+            try:
+                _v8 = MiniRacer()
+                _v8_worker = _v8.eval(REGEX_WORKER_SOURCE)
+            except Exception as exc:  # noqa: BLE001 -- e.g. the bundled V8 library does not load here
+                _drop_v8()
+                raise ToolError(f"jev_extract could not start V8 (mini-racer): {str(exc) or type(exc).__name__}") from exc
         try:
-            return json.loads(_v8.eval(source, timeout_sec=lib.REGEX_TIMEOUT_MS / 1000))
+            return json.loads(_v8_worker(payload, timeout_sec=lib.REGEX_TIMEOUT_MS / 1000))
         except JSTimeoutException:
-            _v8 = None  # the next field starts from a fresh context
+            # V8 stopped the script; the context stays usable for the next field.
             message = f"regex timed out after {lib.REGEX_TIMEOUT_MS}ms; simplify the pattern"
         except Exception as exc:  # noqa: BLE001 -- e.g. out of memory: the field fails, the server does not
-            _v8 = None
+            _drop_v8()
             message = str(exc) or type(exc).__name__
     return {"candidates": [], "truncated": False, "tooLong": 0, "error": message}
 
@@ -991,7 +1016,7 @@ def jev_extract(
     for row in rows:
         if row["error"] or not row["candidates"]:
             continue
-        criteria = {f"c{j}": f"Candidate value: {json.dumps(c, ensure_ascii=False)}" for j, c in enumerate(row["candidates"])}
+        criteria = {f"c{j}": f"Candidate value: {lib.js_json_string(c)}" for j, c in enumerate(row["candidates"])}
         criteria["none_of_them"] = "None of the candidates is the value this field asks for"
         questions[row["key"]] = choice(
             f'Which candidate is the correct value of the field "{row["id"]}" ({row["description"]}) in the document in the state? '

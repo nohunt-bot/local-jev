@@ -7,8 +7,8 @@ request it receives. For each case, in both engine modes (confident,
 garbage), the test requires:
   - the same outcome (a result, or an error),
   - byte-identical engine requests, in the same order, and
-  - the same result JSON, apart from the provider/model fields and the
-    engine-specific error text of an invalid regex.
+  - the same result JSON and byte-identical result text, apart from the
+    provider/model values.
 It also compares tools/list (names, parameter names, required parameters),
 checks the port's JavaScript-compatibility helpers against Node itself, and
 checks that the port reports a dead engine as a tool error.
@@ -121,8 +121,10 @@ const s = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 process.stdout.write(JSON.stringify(s.map(x => x.trim())));
 """
 
-# mini-racer's V8 is newer than Node 22's: syntax Node 22 rejects may compile here.
-KNOWN_REGEX_DIVERGENCE = set()
+# mini-racer's V8 is newer than Node 22's: syntax Node 22 rejects may compile
+# here. Its ICU is older (Unicode 16; Node 22.22 has Unicode 17), so \p{...}
+# differs on characters Unicode 17 changed; the cases below show it.
+KNOWN_REGEX_DIVERGENCE = {"unicode17-extended-pictographic", "unicode17-emoji-presentation"}
 REGEX_CASES = [
     ("dot-excludes-cr", "a\rb a\nb a b axb", r"a.b", "g"),
     ("dollar-not-before-final-newline", "ab\n", r"b$", "g"),
@@ -156,6 +158,10 @@ REGEX_CASES = [
     ("i-non-ascii", "ÉCOLE école", r"école", "gi"),
     ("invalid-pattern", "x", r"(", "g"),
     ("invalid-flag", "x", r"x", "gx"),
+    ("split-surrogate-pair", "Price: \U0001F4B05", r"[^\w\s:]", "g"),
+    ("split-surrogate-dot", "Status: ok \U0001F44D done", r"Status: .{4}", "g"),
+    ("unicode17-extended-pictographic", "Rating: \u2605\u2605\u2605 \U0001F600", r"\p{Extended_Pictographic}", "gu"),
+    ("unicode17-emoji-presentation", "Band: \U0001FA8A night", r"\p{Emoji_Presentation}", "gu"),
 ]
 
 # Patterns an independent review found where a Python translation of
@@ -277,7 +283,8 @@ def run_oracle_checks():
         got = lib.js_number(text)
         got = "NaN" if got is None else ("Infinity" if got == math.inf else "-Infinity" if got == -math.inf else got)
         check(f"Number({text!r})", got == expected, f"py {got!r} js {expected!r}")
-    payloads = [{"a": 1.0, "b": 0.1 + 0.2, "c": 1e-7, "d": [], "e": {}, "f": [1, [2, {"g": None}]], "h": "é\n\"\u2028", "i": True, "j": -0.0, "k": 1e21, "l": 5e-324}]
+    payloads = [{"a": 1.0, "b": 0.1 + 0.2, "c": 1e-7, "d": [], "e": {}, "f": [1, [2, {"g": None}]], "h": "é\n\"\u2028", "i": True, "j": -0.0, "k": 1e21, "l": 5e-324},
+                ["\ud83d", "a\udcb0b", "\U0001F4B0", "\x00\x1f\x7f\\", {"\udcb0key": "\ud83d"}]]
     check("JSON.stringify(value, null, 2)", [lib.js_stringify(v) for v in payloads] == node(JS_STRINGIFY, payloads))
     cases = [{"document": d, "pattern": p, "flags": f} for _, d, p, f in ALL_REGEX_CASES]
     js_out = node(JS_WORKER, cases)
@@ -327,6 +334,8 @@ def build_cases():
             "purpose": "Route support mail.", "context": {"sla_hours": 24.0, "weights": [1.0, 2.5], "nested": {"on": True, "n": None}},
             "auto_accept": 0.7, "minimum_margin": 0.2}),
         ("classify string context", "jev_classify", {"items": [{"text": "x"}], "classes": [{"description": "a"}, {"description": "b"}], "context": "Policy text."}),
+        ("classify __proto__ context", "jev_classify", {"items": [{"text": "x"}], "classes": [{"description": "A"}, {"description": "B"}],
+                                                        "context": {"__proto__": {"policy": "p"}, "k": 1, "nested": {"__proto__": {"p": 1}, "b": 2}}}),
         ("classify duplicate id", "jev_classify", {"items": [{"id": "a", "text": "x"}, {"id": "a", "text": "y"}], "classes": [{"description": "a"}, {"description": "b"}]}),
         ("decide basic", "jev_decide", ti["jev_decide"]),
         ("decide requirements", "jev_decide", {**ti["jev_decide"], "candidates": ti["jev_decide"]["candidates"] + [{"id": "no-cache", "description": "Do nothing."}],
@@ -362,6 +371,8 @@ def build_cases():
         ("extract no matches", "jev_extract", {"document": "nothing here", "fields": [{"id": "n", "pattern": r"\d+", "description": "A number."}]}),
         ("extract sticky", "jev_extract", {"document": "aaab aa", "fields": [{"id": "a", "pattern": r"a", "flags": "y", "description": "Leading a."}]}),
         ("extract duplicate field", "jev_extract", {"document": "x", "fields": [{"id": "a", "pattern": "x", "description": "a"}, {"id": "a", "pattern": "x", "description": "b"}]}),
+        ("extract split emoji", "jev_extract", {"document": "Price: \U0001F4B05", "fields": [{"id": "sym", "pattern": r"[^\w\s:]", "description": "Currency symbol."}]}),
+        ("extract split emoji by dot", "jev_extract", {"document": "Status: ok \U0001F44D done", "fields": [{"id": "st", "pattern": r"Status: .{4}", "description": "Status text."}]}),
         ("review basic", "jev_review", ti["jev_review"]),
         ("review tests and thresholds", "jev_review", {**ti["jev_review"], "tests": "12 passed", "auto_accept": 0.6, "review_at": 0.3, "composite_floor": 0.5}),
         ("review review_at only", "jev_review", {**ti["jev_review"], "review_at": 0.3}),
@@ -385,12 +396,7 @@ def build_cases():
 def normalize(payload):
     if not isinstance(payload, dict):
         return payload
-    out = {k: v for k, v in payload.items() if k not in ("provider", "model")}
-    if out.get("tool") == "jev_extract":
-        for row in out.get("results", []):
-            if row.get("status") == "invalid_pattern":
-                row["reason"] = "<engine-specific regex error>"
-    return out
+    return {k: v for k, v in payload.items() if k not in ("provider", "model")}
 
 
 def normalize_text(text):
